@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import viser
@@ -90,6 +90,7 @@ class BubblifyApp:
         # Visibility settings
         self.show_selected_link: bool = True
         self.show_other_links: bool = True
+        self.robot_opacity: float = 1.0
 
         # Sphere opacity settings
         self.selected_sphere_opacity: float = 1.0
@@ -171,6 +172,11 @@ class BubblifyApp:
             show_selected_link_cb = self.server.gui.add_checkbox("Show Selected Link", initial_value=self.show_selected_link)
             show_other_links_cb = self.server.gui.add_checkbox("Show Other Links", initial_value=self.show_other_links)
 
+            # Robot mesh opacity (lower to see spheres through the robot)
+            robot_opacity = self.server.gui.add_slider(
+                "Robot Opacity", min=0.0, max=1.0, step=0.05, initial_value=self.robot_opacity
+            )
+
             # Sphere opacity controls with clearer names
             selected_sphere_opacity = self.server.gui.add_slider(
                 "Current Sphere", min=0.0, max=1.0, step=0.1, initial_value=self.selected_sphere_opacity
@@ -202,6 +208,13 @@ class BubblifyApp:
             @show_other_links_cb.on_update
             def _(_):
                 self.show_other_links = show_other_links_cb.value
+                self._update_mesh_visibility()
+
+            @robot_opacity.on_update
+            def _(_):
+                self.robot_opacity = robot_opacity.value
+                self.urdf_viz.set_visual_opacity(self.robot_opacity)
+                # Rebuilding meshes resets handles, so reapply visibility state.
                 self._update_mesh_visibility()
 
             @selected_sphere_opacity.on_update
@@ -245,11 +258,7 @@ class BubblifyApp:
             link_sphere_count = self.server.gui.add_text("Spheres on Current Link", initial_value="0")
 
             # Sphere properties
-            # Adjust range so 0.05 is at 33% of the slider range
-            # If 0.05 should be at 33%, then: 0.05 = min + 0.33 * (max - min)
-            # Solving: max = (0.05 - min) / 0.33 + min
-            # With min=0.005: max = (0.05 - 0.005) / 0.33 + 0.005 = 0.14
-            sphere_radius = self.server.gui.add_slider("Radius", min=0.005, max=0.14, step=0.001, initial_value=0.05)
+            sphere_radius = self.server.gui.add_slider("Radius", min=0.005, max=1.0, step=0.001, initial_value=0.05)
             sphere_color = self.server.gui.add_rgb("Color", initial_value=(255, 180, 60))
             self._sphere_radius_slider = sphere_radius  # Store reference
             self._sphere_color_input = sphere_color  # Store reference
@@ -493,12 +502,14 @@ class BubblifyApp:
 
         parent_frame = self.sphere_store.group_nodes[sphere.link]
 
-        # Create sphere visualization with appropriate opacity
+        # Create sphere visualization with appropriate opacity. Spheres that poke
+        # outside the link's mesh surface are drawn red to flag over-coverage.
         opacity = self._get_sphere_opacity(sphere)
+        display_color = self._get_sphere_display_color(sphere)
         sphere.node = self.server.scene.add_icosphere(
             f"{parent_frame.name}/sphere_{sphere.id}",
             radius=sphere.radius,
-            color=sphere.color,
+            color=display_color,
             position=sphere.local_xyz,
             opacity=opacity,
             visible=True,
@@ -705,6 +716,17 @@ class BubblifyApp:
                 # Check if this value exists in the dropdown options
                 if expected_value in self._sphere_dropdown.options:
                     self._sphere_dropdown.value = expected_value
+
+    def _get_sphere_display_color(self, sphere: Sphere) -> Tuple[int, int, int]:
+        """Get the color to render a sphere with.
+
+        Spheres whose surface extends beyond the link's mesh surface are drawn
+        red to flag that they over-approximate the geometry. Otherwise the
+        sphere's own (user-chosen) color is used.
+        """
+        if self.urdf_viz.sphere_protrudes(sphere.link, sphere.local_xyz, sphere.radius):
+            return (255, 0, 0)
+        return sphere.color
 
     def _get_sphere_opacity(self, sphere: Sphere) -> float:
         """Get the appropriate opacity for a sphere based on current selection state."""

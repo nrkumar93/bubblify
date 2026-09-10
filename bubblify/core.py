@@ -129,6 +129,16 @@ class EnhancedViserUrdf:
         self.link_frame: Dict[str, viser.FrameHandle] = {}
         self.link_meshes: Dict[str, List[viser.SceneNodeHandle]] = {}
 
+        # Cache of transformed visual meshes for live opacity rebuilds.
+        # Maps viser node name -> (transformed trimesh, urdf link name).
+        self._visual_mesh_cache: Dict[str, Tuple[trimesh.Trimesh, str]] = {}
+        self._visual_opacity: float = 1.0
+
+        # Per-link collision geometry expressed in the link's own frame, used to
+        # test whether a collision sphere protrudes past the robot surface.
+        # Maps urdf link name -> trimesh.Trimesh (concatenated link geometry).
+        self._link_local_meshes: Dict[str, trimesh.Trimesh] = {}
+
         num_joints_to_repeat = 0
         if load_meshes:
             if urdf.scene is not None:
@@ -160,6 +170,77 @@ class EnhancedViserUrdf:
                 )
 
         self._joint_map_values = [*self._urdf.joint_map.values()] * num_joints_to_repeat
+
+        # Build per-link meshes (in each link's local frame) for protrusion tests.
+        self._build_link_local_meshes()
+
+    def _build_link_local_meshes(self) -> None:
+        """Build a per-link mesh in each link's local frame.
+
+        These meshes are used to test whether a collision sphere protrudes past
+        the robot surface. The collision scene is preferred when available (it is
+        what the spheres approximate); otherwise the visual scene is used.
+        """
+        scene = self._urdf.collision_scene or self._urdf.scene
+        if scene is None:
+            return
+
+        collision_geometry = self._urdf.collision_scene is not None
+        link_pieces: Dict[str, List[trimesh.Trimesh]] = {}
+
+        for geom_name, mesh in scene.geometry.items():
+            if not isinstance(mesh, trimesh.Trimesh):
+                continue
+            link_name = scene.graph.transforms.parents.get(geom_name)
+            if link_name is None:
+                continue
+            try:
+                # Transform from the link frame to this geometry's frame.
+                T_link_geom = self._urdf.get_transform(
+                    geom_name, link_name, collision_geometry=collision_geometry
+                )
+            except Exception:
+                continue
+
+            piece = mesh.copy()
+            piece.apply_scale(self._scale)
+            piece.apply_transform(T_link_geom)
+            link_pieces.setdefault(link_name, []).append(piece)
+
+        for link_name, pieces in link_pieces.items():
+            try:
+                combined = trimesh.util.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+            except Exception:
+                combined = pieces[0]
+            self._link_local_meshes[link_name] = combined
+
+    def sphere_protrudes(
+        self,
+        link_name: str,
+        local_xyz: Tuple[float, float, float],
+        radius: float,
+    ) -> bool:
+        """Return True if a sphere pokes outside the link's mesh surface.
+
+        The sphere is defined in the link's local frame (the same frame Bubblify
+        stores sphere centers in). A sphere is fully contained when the signed
+        distance from its center to the mesh surface is at least its radius
+        (trimesh signed distance is positive inside, negative outside). If the
+        link has no mesh, the sphere cannot be judged and is treated as not
+        protruding.
+        """
+        mesh = self._link_local_meshes.get(link_name)
+        if mesh is None:
+            return False
+
+        try:
+            center = np.asarray([local_xyz], dtype=float)
+            signed = trimesh.proximity.signed_distance(mesh, center)[0]
+        except Exception:
+            return False
+
+        # Contained iff signed >= radius; otherwise part of the surface is outside.
+        return bool(signed < radius)
 
     def _index_scene(self, scene: Scene, collision: bool) -> None:
         """Index link frames and meshes for per-link control."""
@@ -322,7 +403,60 @@ class EnhancedViserUrdf:
                 # Get the actual URDF link name that this mesh belongs to
                 urdf_link_name = scene.graph.transforms.parents[mesh_name]
                 self.link_meshes.setdefault(urdf_link_name, []).append(mesh_handle)
+                # Cache visual meshes so we can rebuild them with a new opacity.
+                if not collision_geometry:
+                    self._visual_mesh_cache[name] = (mesh, urdf_link_name)
         return root_frame
+
+    def set_visual_opacity(self, opacity: float) -> None:
+        """Set the opacity of all visual robot meshes.
+
+        Viser mesh handles do not expose a mutable opacity, so this rebuilds the
+        visual meshes in place by re-adding nodes with their existing names
+        (viser overwrites a scene node when a node with the same name is added).
+        At full opacity the original textured meshes are restored via
+        ``add_mesh_trimesh``; below full opacity ``add_mesh_simple`` is used so a
+        uniform opacity can be applied.
+        """
+        if not self._load_meshes or not self._visual_mesh_cache:
+            return
+
+        opacity = float(min(max(opacity, 0.0), 1.0))
+        self._visual_opacity = opacity
+
+        for name, (mesh, urdf_link_name) in self._visual_mesh_cache.items():
+            # Preserve the current visibility of the link's existing handles.
+            existing = self.link_meshes.get(urdf_link_name, [])
+            visible = existing[0].visible if existing else True
+
+            if opacity >= 1.0:
+                new_handle = self._target.scene.add_mesh_trimesh(name, mesh, visible=visible)
+            else:
+                # Preserve the mesh's base color where trimesh can provide one.
+                try:
+                    color = tuple(int(c) for c in mesh.visual.main_color[:3])
+                except Exception:
+                    color = (150, 150, 150)
+                new_handle = self._target.scene.add_mesh_simple(
+                    name,
+                    mesh.vertices,
+                    mesh.faces,
+                    color=color,
+                    opacity=opacity,
+                    visible=visible,
+                )
+
+            # Replace the stored handle for this link/mesh.
+            self.link_meshes.setdefault(urdf_link_name, [])
+            for i, handle in enumerate(self._meshes):
+                if handle.name == name:
+                    self._meshes[i] = new_handle
+                    break
+            link_handles = self.link_meshes[urdf_link_name]
+            for i, handle in enumerate(link_handles):
+                if handle.name == name:
+                    link_handles[i] = new_handle
+                    break
 
 
 def _viser_name_from_frame(
