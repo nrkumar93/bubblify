@@ -29,6 +29,7 @@ dependencies = [
     "yourdfpy>=0.0.56",
     "trimesh>=4.0.0",
     "numpy>=1.20.0",
+    "PyYAML>=6.0",
 ]
 
 [project.scripts]

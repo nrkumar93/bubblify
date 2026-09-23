@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -91,6 +92,11 @@ class BubblifyApp:
         self.show_selected_link: bool = True
         self.show_other_links: bool = True
         self.robot_opacity: float = 1.0
+        # Debounce timer for robot-opacity rebuilds (slider fires continuously).
+        self._robot_opacity_timer: Optional[threading.Timer] = None
+        # Periodic autosave so a crash can't wipe an in-progress session.
+        self._autosave_timer: Optional[threading.Timer] = None
+        self._autosave_interval: float = 30.0
 
         # Sphere opacity settings
         self.selected_sphere_opacity: float = 1.0
@@ -213,9 +219,10 @@ class BubblifyApp:
             @robot_opacity.on_update
             def _(_):
                 self.robot_opacity = robot_opacity.value
-                self.urdf_viz.set_visual_opacity(self.robot_opacity)
-                # Rebuilding meshes resets handles, so reapply visibility state.
-                self._update_mesh_visibility()
+                # The slider fires continuously while dragging; debounce the
+                # (expensive) mesh rebuild so we only rebuild once the value
+                # settles. This avoids churn/flicker during the drag.
+                self._schedule_robot_opacity_update()
 
             @selected_sphere_opacity.on_update
             def _(_):
@@ -586,14 +593,25 @@ class BubblifyApp:
     def _remove_transform_control(self):
         """Remove the current transform control."""
         if self.transform_control is not None:
-            self.transform_control.remove()
+            # See _remove_radius_gizmo: tolerate an already-removed node so
+            # cleanup can never crash the session.
+            try:
+                self.transform_control.remove()
+            except KeyError:
+                pass
             self.transform_control = None
         self._remove_radius_gizmo()
 
     def _remove_radius_gizmo(self):
         """Remove the current radius gizmo."""
         if self.radius_gizmo is not None:
-            self.radius_gizmo.remove()
+            # viser raises KeyError if the node was already removed (e.g. its
+            # parent frame went away). Swallow it so cleanup can never crash the
+            # session and take unsaved spheres down with it.
+            try:
+                self.radius_gizmo.remove()
+            except KeyError:
+                pass
             self.radius_gizmo = None
 
     def _update_radius_gizmo(self):
@@ -737,17 +755,35 @@ class BubblifyApp:
         else:
             return self.other_links_spheres_opacity
 
+    def _schedule_robot_opacity_update(self, delay: float = 0.12):
+        """Debounce robot-mesh rebuilds triggered by the opacity slider."""
+        if self._robot_opacity_timer is not None:
+            self._robot_opacity_timer.cancel()
+
+        def _apply():
+            self.urdf_viz.set_visual_opacity(self.robot_opacity)
+            # Rebuilding meshes resets handles, so reapply visibility state.
+            self._update_mesh_visibility()
+
+        self._robot_opacity_timer = threading.Timer(delay, _apply)
+        self._robot_opacity_timer.daemon = True
+        self._robot_opacity_timer.start()
+
     def _update_mesh_visibility(self):
         """Update visibility of robot meshes based on link selection."""
+        # A fully transparent robot is hidden entirely (a transparent solid
+        # surface would still write depth and occlude interior spheres).
+        robot_hidden = self.robot_opacity <= 0.0
         for link_name, mesh_handles in self.urdf_viz.link_meshes.items():
             for mesh_handle in mesh_handles:
                 # Determine if this link should be visible
                 if link_name == self.current_link:
                     # This is the selected link
-                    mesh_handle.visible = self.show_selected_link
+                    show = self.show_selected_link
                 else:
                     # This is a non-selected link
-                    mesh_handle.visible = self.show_other_links
+                    show = self.show_other_links
+                mesh_handle.visible = show and not robot_hidden
 
     def _update_sphere_opacities(self):
         """Update opacity of all spheres based on current selection state."""
@@ -758,6 +794,63 @@ class BubblifyApp:
                 sphere.node.opacity = new_opacity
                 # Handle visibility (0.0 opacity = invisible)
                 sphere.node.visible = new_opacity > 0.0
+
+    def _build_spherization_data(self) -> dict:
+        """Build the YAML-serializable spherization dict from the sphere store."""
+        collision_spheres: Dict[str, list] = {}
+        for sphere in self.sphere_store.by_id.values():
+            center = sphere.local_xyz
+            if hasattr(center, "tolist"):
+                center = center.tolist()
+            else:
+                center = [float(x) for x in center]
+            collision_spheres.setdefault(sphere.link, []).append(
+                {"center": center, "radius": float(sphere.radius)}
+            )
+        return {
+            "collision_spheres": collision_spheres,
+            "metadata": {
+                "total_spheres": int(len(self.sphere_store.by_id)),
+                "links": list(collision_spheres.keys()),
+                "export_timestamp": float(time.time()),
+            },
+        }
+
+    def _autosave_recovery(self):
+        """Periodically write current spheres to a recovery file.
+
+        Runs on a background timer so an unexpected crash cannot wipe out an
+        in-progress session. The file uses the same format as the normal export
+        and can be reloaded with ``--spherization_yml``. Writes atomically (to a
+        temp file, then rename) so a crash mid-write can't corrupt it. Only
+        writes when there is at least one sphere.
+        """
+        try:
+            if self.sphere_store.by_id:
+                import yaml
+
+                if self.urdf_path and self.urdf_path.parent:
+                    output_dir = self.urdf_path.parent
+                else:
+                    output_dir = Path.cwd()
+                target = output_dir / ".bubblify_autosave.yml"
+                tmp = target.with_suffix(".yml.tmp")
+                tmp.write_text(
+                    yaml.dump(
+                        self._build_spherization_data(),
+                        default_flow_style=False,
+                        sort_keys=False,
+                    )
+                )
+                tmp.replace(target)
+        except Exception as e:
+            # Autosave must never crash the app; just log and continue.
+            print(f"⚠️  Autosave failed (continuing): {e}")
+        finally:
+            # Reschedule regardless of success/failure.
+            self._autosave_timer = threading.Timer(self._autosave_interval, self._autosave_recovery)
+            self._autosave_timer.daemon = True
+            self._autosave_timer.start()
 
     def _load_spherization_yaml(self, yaml_path: Path):
         """Load sphere configuration from YAML file at startup."""
@@ -809,6 +902,10 @@ class BubblifyApp:
     def run(self):
         """Run the application (blocking)."""
         print("🚀 Application running! Use Ctrl+C to exit.")
+        # Start periodic autosave (recovery file next to the URDF).
+        self._autosave_timer = threading.Timer(self._autosave_interval, self._autosave_recovery)
+        self._autosave_timer.daemon = True
+        self._autosave_timer.start()
         try:
             while True:
                 time.sleep(0.1)
@@ -816,6 +913,8 @@ class BubblifyApp:
             print("\n👋 Shutting down Bubblify...")
         finally:
             # Cleanup
+            if self._autosave_timer is not None:
+                self._autosave_timer.cancel()
             self._remove_transform_control()
             self._remove_radius_gizmo()
             self.urdf_viz.remove()
