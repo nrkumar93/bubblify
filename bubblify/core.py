@@ -132,6 +132,9 @@ class EnhancedViserUrdf:
         # Cache of transformed visual meshes for live opacity rebuilds.
         # Maps viser node name -> (transformed trimesh, urdf link name).
         self._visual_mesh_cache: Dict[str, Tuple[trimesh.Trimesh, str]] = {}
+        # Cached wireframe edge segments per mesh (viser node name -> (E,2,3)
+        # array of line endpoints and base color), computed once at load.
+        self._visual_edge_cache: Dict[str, Tuple[np.ndarray, Tuple[int, int, int]]] = {}
         self._visual_opacity: float = 1.0
 
         # Per-link collision geometry expressed in the link's own frame, used to
@@ -403,20 +406,44 @@ class EnhancedViserUrdf:
                 # Get the actual URDF link name that this mesh belongs to
                 urdf_link_name = scene.graph.transforms.parents[mesh_name]
                 self.link_meshes.setdefault(urdf_link_name, []).append(mesh_handle)
-                # Cache visual meshes so we can rebuild them with a new opacity.
+                # Cache visual meshes so we can rebuild them with a new opacity,
+                # plus their edge segments for the faded wireframe rendering.
                 if not collision_geometry:
                     self._visual_mesh_cache[name] = (mesh, urdf_link_name)
+                    try:
+                        edges = mesh.edges_unique
+                        segments = np.asarray(mesh.vertices[edges], dtype=np.float32)
+                        try:
+                            base_color = tuple(int(c) for c in mesh.visual.main_color[:3])
+                        except Exception:
+                            base_color = (120, 120, 120)
+                        self._visual_edge_cache[name] = (segments, base_color)
+                    except Exception:
+                        pass
         return root_frame
 
     def set_visual_opacity(self, opacity: float) -> None:
         """Set the opacity of all visual robot meshes.
 
-        Viser mesh handles do not expose a mutable opacity, so this rebuilds the
-        visual meshes in place by re-adding nodes with their existing names
-        (viser overwrites a scene node when a node with the same name is added).
-        At full opacity the original textured meshes are restored via
-        ``add_mesh_trimesh``; below full opacity ``add_mesh_simple`` is used so a
-        uniform opacity can be applied.
+        Viser mesh handles do not expose a mutable opacity (or any depth-write
+        control), so this rebuilds the visual meshes in place by re-adding nodes
+        with their existing names (viser overwrites a scene node when a node with
+        the same name is added).
+
+        Because a transparent *solid* surface still writes depth and would
+        occlude collision spheres sitting inside a link, fading does not use a
+        translucent solid surface. Instead:
+
+        - ``opacity >= 1.0``: the original textured meshes are restored via
+          ``add_mesh_trimesh``.
+        - ``0 < opacity < 1.0``: the mesh is replaced by an opaque line-segment
+          wireframe (``add_line_segments``) built from its edges. Real line
+          segments are fully opaque and have no faces, so — unlike a translucent
+          surface or a ``wireframe=True`` mesh — they never enter the renderer's
+          transparent pass and do not smear or accumulate blur as the camera
+          moves. The fade is simulated by blending the line color toward a light
+          background as opacity drops.
+        - ``opacity == 0``: the mesh is hidden entirely.
         """
         if not self._load_meshes or not self._visual_mesh_cache:
             return
@@ -432,19 +459,36 @@ class EnhancedViserUrdf:
             if opacity >= 1.0:
                 new_handle = self._target.scene.add_mesh_trimesh(name, mesh, visible=visible)
             else:
-                # Preserve the mesh's base color where trimesh can provide one.
-                try:
-                    color = tuple(int(c) for c in mesh.visual.main_color[:3])
-                except Exception:
-                    color = (150, 150, 150)
-                new_handle = self._target.scene.add_mesh_simple(
-                    name,
-                    mesh.vertices,
-                    mesh.faces,
-                    color=color,
-                    opacity=opacity,
-                    visible=visible,
+                segments, base_color = self._visual_edge_cache.get(
+                    name, (None, (150, 150, 150))
                 )
+                # Fall back to a solid mesh only if edges are unavailable.
+                if segments is None:
+                    new_handle = self._target.scene.add_mesh_simple(
+                        name,
+                        mesh.vertices,
+                        mesh.faces,
+                        color=base_color,
+                        opacity=1.0,
+                        wireframe=True,
+                        visible=visible and opacity > 0.0,
+                    )
+                else:
+                    # Blend the line color toward a light background as opacity
+                    # drops (1.0 -> base color, 0.0 -> background). Lines stay
+                    # fully opaque, so no transparent-pass accumulation.
+                    bg = 245
+                    blend = max(opacity, 0.15)
+                    color = tuple(
+                        int(round(c * blend + bg * (1.0 - blend))) for c in base_color
+                    )
+                    new_handle = self._target.scene.add_line_segments(
+                        name,
+                        points=segments,
+                        colors=color,
+                        line_width=1.0,
+                        visible=visible and opacity > 0.0,
+                    )
 
             # Replace the stored handle for this link/mesh.
             self.link_meshes.setdefault(urdf_link_name, [])
