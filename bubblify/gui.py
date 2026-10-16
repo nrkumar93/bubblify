@@ -97,6 +97,10 @@ class BubblifyApp:
         # Periodic autosave so a crash can't wipe an in-progress session.
         self._autosave_timer: Optional[threading.Timer] = None
         self._autosave_interval: float = 30.0
+        # Change-triggered autosave: write shortly after any sphere mutation so
+        # the recovery file is always current, not just at the 30s tick. Lightly
+        # debounced so rapid gizmo drags don't thrash the disk.
+        self._dirty_autosave_timer: Optional[threading.Timer] = None
 
         # Sphere opacity settings
         self.selected_sphere_opacity: float = 1.0
@@ -364,6 +368,7 @@ class BubblifyApp:
                 self._update_radius_gizmo()
                 self._update_sphere_properties_ui()
                 self._update_sphere_opacities()
+                self._trigger_autosave()
 
             @delete_sphere_btn.on_click
             def _(_):
@@ -373,6 +378,7 @@ class BubblifyApp:
                     self.current_sphere_id = None
                     self._remove_transform_control()
                     update_sphere_dropdown()
+                    self._trigger_autosave()
 
             def update_sphere_properties():
                 """Update sphere properties from UI."""
@@ -386,6 +392,7 @@ class BubblifyApp:
                     sphere.color = tuple(int(c) for c in sphere_color.value)
                     self._update_sphere_visualization(sphere)
                     self._update_radius_gizmo()
+                    self._trigger_autosave()
 
             sphere_radius.on_update(lambda _: update_sphere_properties())
             sphere_color.on_update(lambda _: update_sphere_properties())
@@ -589,6 +596,7 @@ class BubblifyApp:
                         current_sphere.local_xyz = tuple(self.transform_control.position)
                         self._update_sphere_visualization(current_sphere)
                         self._update_radius_gizmo()
+                        self._trigger_autosave()
 
     def _remove_transform_control(self):
         """Remove the current transform control."""
@@ -679,6 +687,7 @@ class BubblifyApp:
             # Update sphere radius
             s2.radius = new_radius
             self._update_sphere_visualization(s2)
+            self._trigger_autosave()
 
             # Don't reposition the gizmo here! Let the user drag it freely.
             # The gizmo position directly controls the radius - no secondary positioning logic needed.
@@ -816,41 +825,56 @@ class BubblifyApp:
             },
         }
 
-    def _autosave_recovery(self):
-        """Periodically write current spheres to a recovery file.
+    def _write_autosave_file(self):
+        """Write current spheres to the recovery file atomically.
 
-        Runs on a background timer so an unexpected crash cannot wipe out an
-        in-progress session. The file uses the same format as the normal export
-        and can be reloaded with ``--spherization_yml``. Writes atomically (to a
-        temp file, then rename) so a crash mid-write can't corrupt it. Only
-        writes when there is at least one sphere.
+        Uses the same format as the normal export (reloadable with
+        ``--spherization_yml``) and writes to a temp file then renames so a crash
+        mid-write can't corrupt it. Only writes when there is at least one
+        sphere. Never raises — autosave must not crash the app.
         """
         try:
-            if self.sphere_store.by_id:
-                import yaml
+            if not self.sphere_store.by_id:
+                return
+            import yaml
 
-                if self.urdf_path and self.urdf_path.parent:
-                    output_dir = self.urdf_path.parent
-                else:
-                    output_dir = Path.cwd()
-                target = output_dir / ".bubblify_autosave.yml"
-                tmp = target.with_suffix(".yml.tmp")
-                tmp.write_text(
-                    yaml.dump(
-                        self._build_spherization_data(),
-                        default_flow_style=False,
-                        sort_keys=False,
-                    )
+            if self.urdf_path and self.urdf_path.parent:
+                output_dir = self.urdf_path.parent
+            else:
+                output_dir = Path.cwd()
+            target = output_dir / ".bubblify_autosave.yml"
+            tmp = target.with_suffix(".yml.tmp")
+            tmp.write_text(
+                yaml.dump(
+                    self._build_spherization_data(),
+                    default_flow_style=False,
+                    sort_keys=False,
                 )
-                tmp.replace(target)
+            )
+            tmp.replace(target)
         except Exception as e:
-            # Autosave must never crash the app; just log and continue.
             print(f"⚠️  Autosave failed (continuing): {e}")
-        finally:
-            # Reschedule regardless of success/failure.
-            self._autosave_timer = threading.Timer(self._autosave_interval, self._autosave_recovery)
-            self._autosave_timer.daemon = True
-            self._autosave_timer.start()
+
+    def _trigger_autosave(self, delay: float = 0.5):
+        """Autosave shortly after a sphere mutation.
+
+        Called on every add/delete/edit so the recovery file is always current
+        (not just at the periodic tick, which could miss the last changes before
+        a crash). Lightly debounced so rapid gizmo drags coalesce into one write.
+        """
+        if self._dirty_autosave_timer is not None:
+            self._dirty_autosave_timer.cancel()
+        self._dirty_autosave_timer = threading.Timer(delay, self._write_autosave_file)
+        self._dirty_autosave_timer.daemon = True
+        self._dirty_autosave_timer.start()
+
+    def _autosave_recovery(self):
+        """Periodic backstop autosave on a background timer."""
+        self._write_autosave_file()
+        # Reschedule regardless of success/failure.
+        self._autosave_timer = threading.Timer(self._autosave_interval, self._autosave_recovery)
+        self._autosave_timer.daemon = True
+        self._autosave_timer.start()
 
     def _load_spherization_yaml(self, yaml_path: Path):
         """Load sphere configuration from YAML file at startup."""
@@ -912,9 +936,14 @@ class BubblifyApp:
         except KeyboardInterrupt:
             print("\n👋 Shutting down Bubblify...")
         finally:
-            # Cleanup
+            # Cleanup. Cancel timers and flush a final autosave so the latest
+            # state is always on disk, even if changes happened since the last
+            # debounced write.
             if self._autosave_timer is not None:
                 self._autosave_timer.cancel()
+            if self._dirty_autosave_timer is not None:
+                self._dirty_autosave_timer.cancel()
+            self._write_autosave_file()
             self._remove_transform_control()
             self._remove_radius_gizmo()
             self.urdf_viz.remove()
